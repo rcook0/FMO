@@ -1,52 +1,222 @@
-//@version=5
-indicator("EMA5/10 + Stoch + SR + Strong Candle Signals", overlay=true, max_labels_count=500)
+//@version=6
+indicator("EMA5/10 + Stoch + SR + Strong Candle Signals (v6)", overlay=true, max_labels_count=500, max_lines_count=500)
+
 //+------------------------------------------------------------------+
-// FEATURES:
+// FEATURES
 // - EMA 5/10 trend filter
 // - Stochastic confirmation
-// - Strong daily candle confirmation (BodyMinPct configurable)
-// - Manual + pivot-based S/R detection
-// - Near S/R filter
-// - Daily alert messages include symbol, side, price, SL, TP, R:R, nearest SR
-// - Plots arrows / labels on chart
-// INPUTS
-emaFast = input.int(5, "EMA Fast")
-emaSlow = input.int(10, "EMA Slow")
-stochK = input.int(14, "Stochastic %K")
-stochD = input.int(3, "Stochastic %D")
-BodyMinPct = input.float(50.0, "Min Candle Body %")
-UseCandleStrength = input.bool(true, "Use Candle Strength Confirmation")
-NearSRTolerancePct = input.float(0.5, "Near S/R Tolerance %")
-// Manual SR
-SR1 = input.float(0.0, "SR1")
-SR2 = input.float(0.0, "SR2")
-SR3 = input.float(0.0, "SR3")
-SR4 = input.float(0.0, "SR4")
-// Pivot S/R toggle
-UsePivotSR = input.bool(true, "Use Pivot SR")
-PivotLeft = input.int(5, "Pivot Left")
-PivotRight = input.int(5, "Pivot Right")
-// TP / R ratio
-TP_R = input.float(2.0, "TP in R multiples")
+// - Strong candle confirmation (BodyMinPct configurable)
+// - Manual S/R levels (SR1..SR4)
+// - Pivot-based S/R detection (recent pivot highs/lows)
+// - Near S/R filter (percentage tolerance)
+// - Auto SL/TP from signal candle range with TP in R multiples
+// - Alerts include symbol, side, entry, SL, TP, R:R, nearest SR + distance
+// - Plots arrows / labels + optional S/R lines
+//+------------------------------------------------------------------+
 
-//--- EMA Trend
+// ------------------------- Inputs -------------------------
+emaFast             = input.int(5,  "EMA Fast", minval=1)
+emaSlow             = input.int(10, "EMA Slow", minval=1)
+
+stochK              = input.int(14, "Stochastic %K", minval=1)
+stochD              = input.int(3,  "Stochastic %D", minval=1)
+
+UseCandleStrength   = input.bool(true,  "Use Candle Strength Confirmation")
+BodyMinPct          = input.float(50.0, "Min Candle Body %", minval=0.0, maxval=100.0)
+
+NearSRTolerancePct  = input.float(0.5, "Near S/R Tolerance %", minval=0.0, step=0.1)
+
+UseManualSR         = input.bool(true, "Use Manual SR")
+SR1                 = input.float(0.0, "SR1")
+SR2                 = input.float(0.0, "SR2")
+SR3                 = input.float(0.0, "SR3")
+SR4                 = input.float(0.0, "SR4")
+
+UsePivotSR          = input.bool(true, "Use Pivot SR")
+PivotLeft           = input.int(5, "Pivot Left", minval=1)
+PivotRight          = input.int(5, "Pivot Right", minval=1)
+PivotKeepLastN      = input.int(12, "Keep Last N Pivot Levels", minval=1, maxval=100)
+PlotSRLines         = input.bool(true, "Plot SR Lines (Pivot+Manual)")
+
+TP_R                = input.float(2.0, "TP in R multiples", minval=0.1, step=0.1)
+SL_BufferTicks      = input.int(0, "SL Buffer (ticks)", minval=0)
+EntryMode           = input.string("Close", "Entry Price Mode", options=["Close","Next Open"])
+DebounceBars        = input.int(1, "Debounce (bars between signals)", minval=0)
+
+// ------------------------- Helpers -------------------------
+f_is_valid_level(x) =>
+    not na(x) and x != 0.0
+
+f_fmt(x) =>
+    str.tostring(x, format.mintick)
+
+f_abs(x) =>
+    x < 0 ? -x : x
+
+// Nearest SR from a float array
+f_nearest_level(arr, price) =>
+    float best = na
+    float bestDist = na
+    int sz = array.size(arr)
+    for i = 0 to sz - 1
+        float lv = array.get(arr, i)
+        if f_is_valid_level(lv)
+            float dist = f_abs(price - lv)
+            if na(bestDist) or dist < bestDist
+                bestDist := dist
+                best := lv
+    [best, bestDist]
+
+// % distance between price and level (using price as denominator)
+f_dist_pct(price, level) =>
+    (f_abs(price - level) / price) * 100.0
+
+// Keep an array capped to last N values
+f_push_capped(arr, val, maxN) =>
+    if f_is_valid_level(val)
+        array.unshift(arr, val)
+        if array.size(arr) > maxN
+            array.pop(arr)
+
+// ------------------------- Indicators -------------------------
 emaFastVal = ta.ema(close, emaFast)
 emaSlowVal = ta.ema(close, emaSlow)
 
-//--- Placeholder Stoch (for demonstration)
 k = ta.stoch(close, high, low, stochK)
 d = ta.sma(k, stochD)
 
-buySignal = emaFastVal > emaSlowVal and k > d
-sellSignal = emaFastVal < emaSlowVal and k < d
+// Strong candle (on THIS bar)
+range_ = high - low
+bodyPct = range_ > 0 ? (math.abs(close - open) / range_) * 100.0 : 0.0
+bullStrong = close > open and bodyPct >= BodyMinPct
+bearStrong = close < open and bodyPct >= BodyMinPct
 
-// Strong candle confirmation
-bodyPct = math.abs(close - open) / (high - low) * 100
-if UseCandleStrength
-    buySignal := buySignal and close > open and bodyPct >= BodyMinPct
-    sellSignal := sellSignal and close < open and bodyPct >= BodyMinPct
+// Base signals (you can tighten/loosen later)
+baseBuy  = emaFastVal > emaSlowVal and k > d
+baseSell = emaFastVal < emaSlowVal and k < d
 
-plotshape(buySignal, title="Buy Signal", style=shape.triangleup, color=color.green, size=size.small)
-plotshape(sellSignal, title="Sell Signal", style=shape.triangledown, color=color.red, size=size.small)
+buySignal  = UseCandleStrength ? (baseBuy  and bullStrong) : baseBuy
+sellSignal = UseCandleStrength ? (baseSell and bearStrong) : baseSell
 
-// TODO: Add pivot S/R checks, near SR filter, alerts with CSV-style message
+// ------------------------- SR Collection -------------------------
+var float[] srLevels = array.new_float()
+
+// Add manual SR each bar (cheap; list is capped anyway)
+if barstate.isnew
+    if UseManualSR
+        // We push them every bar but capped; this keeps them available without complicated dedupe
+        f_push_capped(srLevels, SR1, PivotKeepLastN)
+        f_push_capped(srLevels, SR2, PivotKeepLastN)
+        f_push_capped(srLevels, SR3, PivotKeepLastN)
+        f_push_capped(srLevels, SR4, PivotKeepLastN)
+
+// Pivot SR: add pivots when they confirm (PivotRight bars later)
+ph = UsePivotSR ? ta.pivothigh(high, PivotLeft, PivotRight) : na
+pl = UsePivotSR ? ta.pivotlow(low,  PivotLeft, PivotRight) : na
+
+if barstate.isnew and UsePivotSR
+    if not na(ph)
+        f_push_capped(srLevels, ph, PivotKeepLastN)
+    if not na(pl)
+        f_push_capped(srLevels, pl, PivotKeepLastN)
+
+// Optional plot SR lines (best-effort; draws last N from array)
+var line[] srLines = array.new_line()
+
+f_clear_lines() =>
+    for i = 0 to array.size(srLines) - 1
+        line.delete(array.get(srLines, i))
+    array.clear(srLines)
+
+if barstate.islast and PlotSRLines
+    f_clear_lines()
+    int sz = array.size(srLevels)
+    // draw up to N lines
+    for i = 0 to math.min(sz - 1, PivotKeepLastN - 1)
+        float lv = array.get(srLevels, i)
+        if f_is_valid_level(lv)
+            l = line.new(bar_index - 200, lv, bar_index + 20, lv, extend=extend.right, width=1, color=color.new(color.gray, 75))
+            array.push(srLines, l)
+
+// ------------------------- Near SR Filter -------------------------
+entryPrice = EntryMode == "Next Open" ? open : close
+
+[nearestSR, nearestDist] = f_nearest_level(srLevels, entryPrice)
+nearPct = (not na(nearestSR) and entryPrice != 0.0) ? f_dist_pct(entryPrice, nearestSR) : na
+isNearSR = (not na(nearPct)) ? (nearPct <= NearSRTolerancePct) : false
+
+// Apply "near SR" requirement: only take signals if near SR exists (if any SR configured)
+hasAnySR = array.size(srLevels) > 0
+buyFinal  = buySignal  and (not hasAnySR or isNearSR)
+sellFinal = sellSignal and (not hasAnySR or isNearSR)
+
+// Debounce to prevent spam
+var int lastSigBar = na
+canFire = na(lastSigBar) ? true : (bar_index - lastSigBar > DebounceBars)
+buyFinal  := buyFinal  and canFire
+sellFinal := sellFinal and canFire
+if buyFinal or sellFinal
+    lastSigBar := bar_index
+
+// ------------------------- SL/TP Model -------------------------
+// SL based on current candle range (simple + robust for D1 context)
+// BUY: SL below low; SELL: SL above high; add tick buffer.
+tick = syminfo.mintick
+buf = SL_BufferTicks * tick
+
+buySL  = low - buf
+sellSL = high + buf
+
+buyR  = entryPrice - buySL
+sellR = sellSL - entryPrice
+
+buyTP  = entryPrice + TP_R * buyR
+sellTP = entryPrice - TP_R * sellR
+
+rrStr = str.tostring(TP_R, format.mintick) + "R"
+
+// ------------------------- Plotting -------------------------
+plot(emaFastVal, "EMA Fast", color=color.new(color.teal, 0))
+plot(emaSlowVal, "EMA Slow", color=color.new(color.orange, 0))
+
+plotshape(buyFinal,  title="Buy Signal",  style=shape.triangleup,   color=color.new(color.lime, 0), size=size.small, location=location.belowbar, text="BUY")
+plotshape(sellFinal, title="Sell Signal", style=shape.triangledown, color=color.new(color.red, 0),  size=size.small, location=location.abovebar, text="SELL")
+
+// Labels with details
+if buyFinal
+    txt = "BUY " + syminfo.ticker +
+        "\nEntry: " + f_fmt(entryPrice) +
+        "\nSL: " + f_fmt(buySL) +
+        "\nTP: " + f_fmt(buyTP) +
+        "\nRR: " + rrStr +
+        (not na(nearestSR) ? ("\nNear SR: " + f_fmt(nearestSR) + " (" + str.tostring(nearPct, "#.##") + "%)") : "")
+    label.new(bar_index, low, txt, style=label.style_label_up, textcolor=color.white, color=color.new(color.green, 0))
+
+if sellFinal
+    txt = "SELL " + syminfo.ticker +
+        "\nEntry: " + f_fmt(entryPrice) +
+        "\nSL: " + f_fmt(sellSL) +
+        "\nTP: " + f_fmt(sellTP) +
+        "\nRR: " + rrStr +
+        (not na(nearestSR) ? ("\nNear SR: " + f_fmt(nearestSR) + " (" + str.tostring(nearPct, "#.##") + "%)") : "")
+    label.new(bar_index, high, txt, style=label.style_label_down, textcolor=color.white, color=color.new(color.red, 0))
+
+// ------------------------- Alerts -------------------------
+// CSV-ish alert format (easy to parse)
+// symbol,side,entry,sl,tp,rr,nearest_sr,near_pct
+alertMsgBuy =
+    syminfo.ticker + ",BUY," +
+    f_fmt(entryPrice) + "," + f_fmt(buySL) + "," + f_fmt(buyTP) + "," +
+    rrStr + "," +
+    (not na(nearestSR) ? f_fmt(nearestSR) : "na") + "," +
+    (not na(nearPct) ? str.tostring(nearPct, "#.##") : "na")
+
+alertMsgSell =
+    syminfo.ticker + ",SELL," +
+    f_fmt(entryPrice) + "," + f_fmt(sellSL) + "," + f_fmt(sellTP) + "," +
+    rrStr + "," +
+    (not na(nearestSR) ? f_fmt(nearestSR) : "na") + "," +
+    (not na(nearPct) ? str.tostring(nearPct, "#.##") : "na")
+
+alertcondition(buyFinal,  title="BUY Alert",  message=alertMsgBuy)
+alertcondition(sellFinal, title="SELL Alert", message=alertMsgSell)
